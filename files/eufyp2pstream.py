@@ -7,17 +7,12 @@ import threading
 import time
 import sys
 import signal
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 from queue import Queue
 
 RECV_CHUNK_SIZE = 4096
 
-video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-audio_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-backchannel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-EVENT_CONFIGURATION: dict = {
+EVENT_CONFIGURATION = {
     "livestream video data": {
         "name": "video_data",
         "value": "buffer",
@@ -52,7 +47,7 @@ SEND_TALKBACK_AUDIO_DATA = {
     "messageId": "talkback_audio_data",
     "command": "device.talkback_audio_data",
     "serialNumber": None,
-    "buffer": None
+    "buffer": None,
 }
 
 STOP_TALKBACK = {
@@ -83,6 +78,21 @@ def exit_handler(signum, frame):
 
 # Install signal handler
 signal.signal(signal.SIGINT, exit_handler)
+
+devices = [
+    {
+        "name": "doorbell",
+        "video_port": 63336,
+        "audio_port": 63337,
+        "backchannel_port": 63338,
+    },
+    {
+        "name": "camera",
+        "video_port": 63346,
+        "audio_port": 63347,
+        "backchannel_port": 63348,
+    },
+]
 
 class ClientAcceptThread(threading.Thread):
     def __init__(self, socket, run_event, name, ws, serialno):
@@ -166,9 +176,7 @@ class ClientSendThread(threading.Thread):
                     time.sleep(0.1)
                 else:
                     sys.stdout.flush()
-                    self.client_sock.sendall(
-                        bytearray(self.queue.get(True)["data"])
-                    )
+                    self.client_sock.sendall(bytearray(self.queue.get(True)["data"]))
                     sys.stdout.flush()
         except socket.error as e:
             print("Connection lost", self.name, e)
@@ -198,7 +206,7 @@ class ClientRecvThread(threading.Thread):
         msg["serialNumber"] = self.serialno
         asyncio.run(self.ws.send_message(json.dumps(msg)))
         try:
-            curr_packet = bytearray() 
+            curr_packet = bytearray()
             while not self.run_event.is_set():
                 try:
                     data = self.client_sock.recv(RECV_CHUNK_SIZE)
@@ -206,9 +214,9 @@ class ClientRecvThread(threading.Thread):
                     if len(data) > 0 and len(data) < RECV_CHUNK_SIZE:
                         msg = SEND_TALKBACK_AUDIO_DATA.copy()
                         msg["serialNumber"] = self.serialno
-                        msg["buffer"] = list(bytes(curr_packet)) 
+                        msg["buffer"] = list(bytes(curr_packet))
                         asyncio.run(self.ws.send_message(json.dumps(msg)))
-                        curr_packet = bytearray() 
+                        curr_packet = bytearray()
                 except BlockingIOError:
                     # Resource temporarily unavailable (errno EWOULDBLOCK)
                     pass
@@ -229,38 +237,41 @@ class ClientRecvThread(threading.Thread):
 
 class Connector:
     def __init__(self, run_event):
-        video_sock.bind(("0.0.0.0", 63336))
-        video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        video_sock.settimeout(1) # timeout for listening
-        video_sock.listen()
-        audio_sock.bind(("0.0.0.0", 63337))
-        audio_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        audio_sock.settimeout(1) # timeout for listening
-        audio_sock.listen()
-        backchannel_sock.bind(("0.0.0.0", 63338))
-        backchannel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        backchannel_sock.settimeout(1) # timeout for listening
-        backchannel_sock.listen()
+        self.sockets = {}
         self.ws = None
         self.run_event = run_event
-        self.devices = {}
+        self.device_threads = {}
+
+        for device in devices:
+            video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            audio_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            backchannel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            video_sock.bind(("0.0.0.0", device["video_port"]))
+            video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            video_sock.settimeout(1)
+            video_sock.listen()
+
+            audio_sock.bind(("0.0.0.0", device["audio_port"]))
+            audio_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            audio_sock.settimeout(1)
+            audio_sock.listen()
+
+            backchannel_sock.bind(("0.0.0.0", device["backchannel_port"]))
+            backchannel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            backchannel_sock.settimeout(1)
+            backchannel_sock.listen()
+
+            self.sockets[device["name"]] = {
+                "video": video_sock,
+                "audio": audio_sock,
+                "backchannel": backchannel_sock,
+            }
 
     def stop(self):
-        try:                                                                                            
-            video_sock.shutdown(socket.SHUT_RDWR)                                                 
-        except OSError:                                                                                 
-            print("Error shutdown socket")                                                
-        video_sock.close()
-        try:                 
-            audio_sock.shutdown(socket.SHUT_RDWR)
-        except OSError:      
-            print("Error shutdown socket")
-        audio_sock.close()
-        try:                 
-            backchannel_sock.shutdown(socket.SHUT_RDWR)
-        except OSError:      
-            print("Error shutdown socket")
-        backchannel_sock.close()
-
-    def setWs(self, ws: EufySecurityWebSocket):
-       
+        for device_name, socks in self.sockets.items():
+            for sock_type, sock in socks.items():
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    print(f"Error shutdown socket {sock_type
