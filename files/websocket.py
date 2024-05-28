@@ -1,14 +1,10 @@
 import logging
-
 import asyncio
 import aiohttp
 import traceback
-from typing import Any, Coroutine, Text
-from typing import Callable
-
+from typing import Any, Coroutine, Text, Callable
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
-
 
 class EufySecurityWebSocket:
     def __init__(
@@ -17,7 +13,7 @@ class EufySecurityWebSocket:
         port: int,
         session: aiohttp.ClientSession,
         open_callback: Callable[[], Coroutine[Any, Any, None]],
-        message_callback: Callable[[], Coroutine[Any, Any, None]],
+        message_callback: Callable[[Any], Coroutine[Any, Any, None]],  # Adjusted typing to accept message
         close_callback: Callable[[], Coroutine[Any, Any, None]],
         error_callback: Callable[[Text], Coroutine[Any, Any, None]],
     ):
@@ -34,13 +30,25 @@ class EufySecurityWebSocket:
         self.loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
 
     async def connect(self):
-        print(f" - set_ws - connect")
-        self.ws: aiohttp.ClientWebSocketResponse = await self.session.ws_connect(
-            self.base, autoclose=False, autoping=True, heartbeat=60
-        )
-        task = self.loop.create_task(self.process_messages())
-        task.add_done_callback(self.on_close)
-        await self.async_on_open()
+        retries = 5
+        delay = 5  # seconds
+
+        for attempt in range(retries):
+            try:
+                print(f"Attempting to connect to WebSocket: {self.base} (Attempt {attempt+1})")
+                self.ws = await self.session.ws_connect(
+                    self.base, autoclose=False, autoping=True, heartbeat=60
+                )
+                task = self.loop.create_task(self.process_messages())
+                task.add_done_callback(self.on_close)
+                await self.async_on_open()
+                return  # Exit the loop if connection is successful
+            except aiohttp.client_exceptions.ClientConnectorError as e:
+                _LOGGER.error(f"Attempt {attempt+1} failed: {e}. Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+                continue
+        _LOGGER.error("Failed to connect after several attempts. Exiting.")
+        self.on_error("Failed to connect after several attempts.")
 
     async def async_on_open(self) -> None:
         if not self.ws.closed:
@@ -65,21 +73,21 @@ class EufySecurityWebSocket:
             await self.message_callback(message)
 
     def on_error(self, error: Text = "Unspecified") -> None:
-        print(f" - WebSocket Error: %s", error)
+        _LOGGER.error(f" - WebSocket Error: %s", error)
         if self.error_callback is not None:
             asyncio.run_coroutine_threadsafe(
                 self.error_callback(error), self.loop
             ).result()
 
     def on_close(self, future="") -> None:
-        print(f" - WebSocket Connection Closed. %s", future)
-        print(
-            f" - WebSocket Connection Closed. %s", self.close_callback
-        )
+        _LOGGER.info(f" - WebSocket Connection Closed. %s", future)
         if self.close_callback is not None:
             self.ws = None
-            asyncio.run_coroutine_threadsafe(self.close_callback(), self.loop)
+            asyncio.run_coroutine_threadsafe(self.close_callback(), self.loop).result()
 
     async def send_message(self, message):
-        #print(f" - WebSocket message sent. %s", message)
-        await self.ws.send_str(message)
+        if self.ws and not self.ws.closed:
+            await self.ws.send_str(message)
+        else:
+            _LOGGER.warning(f"Attempted to send message but WebSocket is closed: {message}")
+
