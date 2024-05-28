@@ -238,4 +238,40 @@ class ClientRecvThread(threading.Thread):
 class Connector:
     def __init__(self, run_event):
         self.sockets = {}
-        self.ws =
+        self.ws = None
+        self.run_event = run_event
+        self.device_threads = {}
+
+        for device in devices:
+            video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            audio_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            backchannel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            video_sock.bind(("0.0.0.0", device["video_port"]))
+            video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            video_sock.settimeout(1)
+            video_sock.listen()
+
+            audio_sock.bind(("0.0.0.0", device["audio_port"]))
+            audio_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            audio_sock.settimeout(1)
+            audio_sock.listen()
+
+            backchannel_sock.bind(("0.0.0.0", device["backchannel_port"]))
+            backchannel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            backchannel_sock.settimeout(1)
+            backchannel_sock.listen()
+
+            self.sockets[device["name"]] = {
+                "video": video_sock,
+                "audio": audio_sock,
+                "backchannel": backchannel_sock,
+            }
+
+    def stop(self):
+        for device_name, socks in self.sockets.items():
+            for sock_type, sock in socks.items():
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    print(f"Error shutdown socket {sock_type}")
