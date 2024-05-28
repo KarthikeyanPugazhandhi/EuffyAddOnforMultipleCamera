@@ -12,66 +12,24 @@ from queue import Queue
 
 RECV_CHUNK_SIZE = 4096
 
-EVENT_CONFIGURATION = {
-    "livestream video data": {
-        "name": "video_data",
-        "value": "buffer",
-        "type": "event",
-    },
-    "livestream audio data": {
-        "name": "audio_data",
-        "value": "buffer",
-        "type": "event",
-    },
-}
+# Define a class to encapsulate camera-related information
+class Camera:
+    def __init__(self, serial_number):
+        self.serial_number = serial_number
+        self.video_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.backchannel_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.video_thread = None
+        self.audio_thread = None
+        self.backchannel_thread = None
+        self.video_queue = Queue(100)
+        self.audio_queue = Queue(100)
 
-START_P2P_LIVESTREAM_MESSAGE = {
-    "messageId": "start_livestream",
-    "command": "device.start_livestream",
-    "serialNumber": None,
-}
-
-STOP_P2P_LIVESTREAM_MESSAGE = {
-    "messageId": "stop_livestream",
-    "command": "device.stop_livestream",
-    "serialNumber": None,
-}
-
-START_TALKBACK = {
-    "messageId": "start_talkback",
-    "command": "device.start_talkback",
-    "serialNumber": None,
-}
-
-SEND_TALKBACK_AUDIO_DATA = {
-    "messageId": "talkback_audio_data",
-    "command": "device.talkback_audio_data",
-    "serialNumber": None,
-    "buffer": None,
-}
-
-STOP_TALKBACK = {
-    "messageId": "stop_talkback",
-    "command": "device.stop_talkback",
-    "serialNumber": None,
-}
-
-SET_API_SCHEMA = {
-    "messageId": "set_api_schema",
-    "command": "set_api_schema",
-    "schemaVersion": 13,
-}
-
-P2P_LIVESTREAMING_STATUS = "p2pLiveStreamingStatus"
-
-START_LISTENING_MESSAGE = {"messageId": "start_listening", "command": "start_listening"}
-
-TALKBACK_RESULT_MESSAGE = {"messageId": "talkback_audio_data", "errorCode": "device_talkback_not_running"}
-
-DRIVER_CONNECT_MESSAGE = {"messageId": "driver_connect", "command": "driver.connect"}
-
+# Global variables
+cameras = {}  # Dictionary to store camera objects by serial number
 run_event = threading.Event()
 
+# Signal handler
 def exit_handler(signum, frame):
     print(f'Signal handler called with signal {signum}')
     run_event.set()
@@ -79,247 +37,207 @@ def exit_handler(signum, frame):
 # Install signal handler
 signal.signal(signal.SIGINT, exit_handler)
 
-devices = [
-    {
-        "name": "doorbell",
-        "video_port": 63336,
-        "audio_port": 63337,
-        "backchannel_port": 63338,
-    },
-    {
-        "name": "camera",
-        "video_port": 63346,
-        "audio_port": 63347,
-        "backchannel_port": 63348,
-    },
-]
-
+# Define classes for client threads
 class ClientAcceptThread(threading.Thread):
-    def __init__(self, socket, run_event, name, ws, serialno):
+    def __init__(self, socket, run_event, name, ws, camera):
         threading.Thread.__init__(self)
         self.socket = socket
-        self.queues = []
         self.run_event = run_event
         self.name = name
         self.ws = ws
-        self.serialno = serialno
-        self.my_threads = []
-
-    def update_threads(self):
-        my_threads_before = len(self.my_threads)
-        for thread in self.my_threads:
-            if not thread.is_alive():
-                self.queues.remove(thread.queue)
-        self.my_threads = [t for t in self.my_threads if t.is_alive()]
-        if self.ws and my_threads_before > 0 and len(self.my_threads) == 0:
-            if self.name == "BackChannel":
-                print("All clients died (BackChannel): ", self.name)
-                sys.stdout.flush()
-            else:
-                print("All clients died. Stopping Stream: ", self.name)
-                sys.stdout.flush()
-
-                msg = STOP_P2P_LIVESTREAM_MESSAGE.copy()
-                msg["serialNumber"] = self.serialno
-                asyncio.run(self.ws.send_message(json.dumps(msg)))
+        self.camera = camera
 
     def run(self):
-        print("Accepting connection for ", self.name)
+        print("Accepting connection for", self.name)
         msg = STOP_TALKBACK.copy()
-        msg["serialNumber"] = self.serialno
+        msg["serialNumber"] = self.camera.serial_number
         asyncio.run(self.ws.send_message(json.dumps(msg)))
         while not self.run_event.is_set():
-            self.update_threads()
-            sys.stdout.flush()
             try:
                 client_sock, client_addr = self.socket.accept()
-                print("New connection added: ", client_addr, " for ", self.name)
-                sys.stdout.flush()
-
+                print("New connection added:", client_addr, "for", self.name)
                 if self.name == "BackChannel":
                     client_sock.setblocking(True)
                     print("Starting BackChannel")
-                    thread = ClientRecvThread(client_sock, run_event, self.name, self.ws, self.serialno)
+                    thread = ClientRecvThread(client_sock, run_event, self.name, self.ws, self.camera)
                     thread.start()
                 else:
                     client_sock.setblocking(False)
-                    thread = ClientSendThread(client_sock, run_event, self.name, self.ws, self.serialno)
-                    self.queues.append(thread.queue)
+                    thread = ClientSendThread(client_sock, run_event, self.name, self.ws, self.camera)
                     if self.ws:
                         msg = START_P2P_LIVESTREAM_MESSAGE.copy()
-                        msg["serialNumber"] = self.serialno
+                        msg["serialNumber"] = self.camera.serial_number
                         asyncio.run(self.ws.send_message(json.dumps(msg)))
-                    self.my_threads.append(thread)
                     thread.start()
             except socket.timeout:
                 pass
 
 class ClientSendThread(threading.Thread):
-    def __init__(self, client_sock, run_event, name, ws, serialno):
+    def __init__(self, client_sock, run_event, name, ws, camera):
         threading.Thread.__init__(self)
         self.client_sock = client_sock
-        self.queue = Queue(100)
         self.run_event = run_event
         self.name = name
         self.ws = ws
-        self.serialno = serialno
+        self.camera = camera
 
     def run(self):
-        print("Thread running: ", self.name)
-        sys.stdout.flush()
-
+        print("Thread running:", self.name)
         try:
             while not self.run_event.is_set():
-                if self.queue.empty():
+                if self.name == "Video":
+                    queue = self.camera.video_queue
+                elif self.name == "Audio":
+                    queue = self.camera.audio_queue
+                if not queue.empty():
+                    data = queue.get()
+                    self.client_sock.sendall(bytearray(data))
+                else:
                     # Send something to know if socket is dead
                     self.client_sock.sendall(bytearray(0))
                     time.sleep(0.1)
-                else:
-                    sys.stdout.flush()
-                    self.client_sock.sendall(bytearray(self.queue.get(True)["data"]))
-                    sys.stdout.flush()
         except socket.error as e:
             print("Connection lost", self.name, e)
-            pass
         except socket.timeout:
-            print("Timeout on socket for ", self.name)
-            pass
+            print("Timeout on socket for", self.name)
         try:
             self.client_sock.shutdown(socket.SHUT_RDWR)
         except OSError:
-            print("Error shutdown socket: ", self.name)
+            print("Error shutdown socket:", self.name)
         self.client_sock.close()
-        print("Thread stopping: ", self.name)
-        sys.stdout.flush()
+        print("Thread stopping:", self.name)
 
 class ClientRecvThread(threading.Thread):
-    def __init__(self, client_sock, run_event, name, ws, serialno):
+    def __init__(self, client_sock, run_event, name, ws, camera):
         threading.Thread.__init__(self)
         self.client_sock = client_sock
         self.run_event = run_event
         self.name = name
         self.ws = ws
-        self.serialno = serialno
+        self.camera = camera
 
     def run(self):
         msg = START_TALKBACK.copy()
-        msg["serialNumber"] = self.serialno
+        msg["serialNumber"] = self.camera.serial_number
         asyncio.run(self.ws.send_message(json.dumps(msg)))
         try:
             curr_packet = bytearray()
             while not self.run_event.is_set():
-                try:
-                    data = self.client_sock.recv(RECV_CHUNK_SIZE)
-                    curr_packet += bytearray(data)
-                    if len(data) > 0 and len(data) < RECV_CHUNK_SIZE:
-                        msg = SEND_TALKBACK_AUDIO_DATA.copy()
-                        msg["serialNumber"] = self.serialno
-                        msg["buffer"] = list(bytes(curr_packet))
-                        asyncio.run(self.ws.send_message(json.dumps(msg)))
-                        curr_packet = bytearray()
-                except BlockingIOError:
-                    # Resource temporarily unavailable (errno EWOULDBLOCK)
-                    pass
+                data = self.client_sock.recv(RECV_CHUNK_SIZE)
+                if not data:
+                    break
+                curr_packet += bytearray(data)
+                if len(data) < RECV_CHUNK_SIZE:
+                    if self.name == "Audio":
+                        queue = self.camera.audio_queue
+                    elif self.name == "Video":
+                        queue = self.camera.video_queue
+                    msg = SEND_TALKBACK_AUDIO_DATA.copy()
+                    msg["serialNumber"] = self.camera.serial_number
+                    msg["buffer"] = list(bytes(curr_packet))
+                                       asyncio.run(self.ws.send_message(json.dumps(msg)))
+                    curr_packet = bytearray()
         except socket.error as e:
             print("Connection lost", self.name, e)
-            pass
         except socket.timeout:
-            print("Timeout on socket for ", self.name)
-            pass
+            print("Timeout on socket for", self.name)
         try:
             self.client_sock.shutdown(socket.SHUT_RDWR)
         except OSError:
-            print("Error shutdown socket: ", self.name)
+            print("Error shutdown socket:", self.name)
         self.client_sock.close()
         msg = STOP_TALKBACK.copy()
-        msg["serialNumber"] = self.serialno
+        msg["serialNumber"] = self.camera.serial_number
         asyncio.run(self.ws.send_message(json.dumps(msg)))
 
+# Define a class for WebSocket connection management
 class Connector:
     def __init__(self, run_event):
-        self.sockets = {}
-        self.ws = None
         self.run_event = run_event
-        self.device_threads = {}
+        self.ws = None
 
-        for device in devices:
-            video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            audio_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            backchannel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def set_ws(self, ws):
+        self.ws = ws
 
-            video_sock.bind(("0.0.0.0", device["video_port"]))
-            video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            video_sock.settimeout(1)
-            video_sock.listen()
+    async def on_open(self):
+        print("on_open - executed")
 
-            audio_sock.bind(("0.0.0.0", device["audio_port"]))
-            audio_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            audio_sock.settimeout(1)
-            audio_sock.listen()
+    async def on_close(self):
+        print("on_close - executed")
+        self.run_event.set()
 
-            backchannel_sock.bind(("0.0.0.0", device["backchannel_port"]))
-            backchannel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            backchannel_sock.settimeout(1)
-            backchannel_sock.listen()
+    async def on_error(self, message):
+        print("on_error - executed -", message)
 
-            self.sockets[device["name"]] = {
-                "video": video_sock,
-                "audio": audio_sock,
-                "backchannel": backchannel_sock,
-            }
+    async def on_message(self, message):
+        payload = message.json()
+        message_type = payload["type"]
+        if message_type == "result":
+            message_id = payload["messageId"]
+            if message_id == START_LISTENING_MESSAGE["messageId"]:
+                message_result = payload[message_type]
+                states = message_result["state"]
+                for state in states["devices"]:
+                    serial_number = state["serialNumber"]
+                    cameras[serial_number] = Camera(serial_number)
+                    video_thread = ClientAcceptThread(cameras[serial_number].video_socket, run_event, "Video", self.ws, cameras[serial_number])
+                    audio_thread = ClientAcceptThread(cameras[serial_number].audio_socket, run_event, "Audio", self.ws, cameras[serial_number])
+                    backchannel_thread = ClientAcceptThread(cameras[serial_number].backchannel_socket, run_event, "BackChannel", self.ws, cameras[serial_number])
+                    cameras[serial_number].video_thread = video_thread
+                    cameras[serial_number].audio_thread = audio_thread
+                    cameras[serial_number].backchannel_thread = backchannel_thread
+                    video_thread.start()
+                    audio_thread.start()
+                    backchannel_thread.start()
+            if message_id == TALKBACK_RESULT_MESSAGE["messageId"] and "errorCode" in payload:
+                error_code = payload["errorCode"]
+                if error_code == "device_talkback_not_running":
+                    msg = START_TALKBACK.copy()
+                    for camera in cameras.values():
+                        msg["serialNumber"] = camera.serial_number
+                        asyncio.run(self.ws.send_message(json.dumps(msg)))
 
-    def stop(self):
-        for device_name, socks in self.sockets.items():
-            for sock_type, sock in socks.items():
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    print(f"Error shutdown socket {sock_type}")
+        if message_type == "event":
+            message = payload[message_type]
+            event_type = message["event"]
+            if event_type in ("livestream audio data", "livestream video data"):
+                camera_serial = message.get("serialNumber")
+                if camera_serial in cameras:
+                    camera = cameras[camera_serial]
+                    queue = camera.audio_queue if event_type == "livestream audio data" else camera.video_queue
+                    event_value = message.get("buffer")
+                    queue.put(event_value)
+            elif event_type == "livestream error":
+                print("Livestream Error!")
+                for camera in cameras.values():
+                    msg = START_P2P_LIVESTREAM_MESSAGE.copy()
+                    msg["serialNumber"] = camera.serial_number
+                    asyncio.run(self.ws.send_message(json.dumps(msg))))
 
-async def run(ws_url, ws_port):
-    connector = Connector(run_event)
+# Websocket connector
+c = Connector(run_event)
 
-    async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(f'{ws_url}:{ws_port}') as ws:
-            connector.ws = ws
-            print("Connected to WebSocket")
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
-                    if data["type"] == "event" and data["event"]["name"] in ["livestream video data", "livestream audio data"]:
-                        device_name = next((device["name"] for device in devices if device["serialNumber"] == data["event"]["serialNumber"]), None)
-                        if device_name:
-                            if data["event"]["name"] == "livestream video data":
-                                for queue in connector.device_threads[device_name]["video"].queues:
-                                    queue.put(data["event"])
-                            elif data["event"]["name"] == "livestream audio data":
-                                for queue in connector.device_threads[device_name]["audio"].queues:
-                                    queue.put(data["event"])
-                    elif data["type"] == "result" and data["success"] == True:
-                        if data["result"]["messageId"] == "start_livestream":
-                            device_name = next((device["name"] for device in devices if device["serialNumber"] == data["result"]["serialNumber"]), None)
-                            if device_name:
-                                connector.device_threads[device_name] = {
-                                    "video": ClientAcceptThread(connector.sockets[device_name]["video"], run_event, "Video", ws, data["result"]["serialNumber"]),
-                                    "audio": ClientAcceptThread(connector.sockets[device_name]["audio"], run_event, "Audio", ws, data["result"]["serialNumber"]),
-                                    "backchannel": ClientAcceptThread(connector.sockets[device_name]["backchannel"], run_event, "BackChannel", ws, data["result"]["serialNumber"])
-                                }
-                                connector.device_threads[device_name]["video"].start()
-                                connector.device_threads[device_name]["audio"].start()
-                                connector.device_threads[device_name]["backchannel"].start()
-                        elif data["result"]["messageId"] == "stop_livestream":
-                            device_name = next((device["name"] for device in devices if device["serialNumber"] == data["result"]["serialNumber"]), None)
-                            if device_name:
-                                for thread in connector.device_threads[device_name].values():
-                                    thread.run_event.set()
-                                del connector.device_threads[device_name]
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    break
+async def init_websocket():
+    ws = EufySecurityWebSocket(
+        "402f1039-eufy-security-ws",
+        sys.argv[1],
+        aiohttp.ClientSession(),
+        c.on_open,
+        c.on_message,
+        c.on_close,
+        c.on_error,
+    )
+    c.set_ws(ws)
+    try:
+        await ws.connect()
+        await ws.send_message(json.dumps(START_LISTENING_MESSAGE))
+        while not run_event.is_set():
+            await asyncio.sleep(1000)
+    except Exception as ex:
+        print(ex)
+        print("init_websocket failed. Exiting.")
 
-    connector.stop()
+# Main function
+loop = asyncio.get_event_loop()
+loop.run_until_complete(init_websocket())
 
-if __name__ == "__main__":
-    ws_url = os.getenv('EUFY_SECURITY_WS_URL', 'ws://localhost')
-    ws_port = os.getenv('EUFY_SECURITY_WS_PORT', '3000')
-
-    asyncio.run(run(ws_url, ws_port))
