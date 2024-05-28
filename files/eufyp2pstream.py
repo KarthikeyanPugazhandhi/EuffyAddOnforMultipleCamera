@@ -17,7 +17,6 @@ video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 audio_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 backchannel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-
 EVENT_CONFIGURATION: dict = {
     "livestream video data": {
         "name": "video_data",
@@ -276,7 +275,7 @@ class Connector:
                         video_thread = ClientAcceptThread(video_sock, self.run_event, "Video", ws, serialno)
                         audio_thread = ClientAcceptThread(audio_sock, self.run_event, "Audio", ws, serialno)
                         backchannel_thread = ClientAcceptThread(backchannel_sock, self.run_event, "BackChannel", ws, serialno)
-                        
+
                         self.add_thread(video_thread)
                         self.add_thread(audio_thread)
                         self.add_thread(backchannel_thread)
