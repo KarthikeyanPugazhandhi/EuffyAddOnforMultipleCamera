@@ -275,3 +275,51 @@ class Connector:
                     sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     print(f"Error shutdown socket {sock_type}")
+
+async def run(ws_url, ws_port):
+    connector = Connector(run_event)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(f'{ws_url}:{ws_port}') as ws:
+            connector.ws = ws
+            print("Connected to WebSocket")
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if data["type"] == "event" and data["event"]["name"] in ["livestream video data", "livestream audio data"]:
+                        device_name = next((device["name"] for device in devices if device["serialNumber"] == data["event"]["serialNumber"]), None)
+                        if device_name:
+                            if data["event"]["name"] == "livestream video data":
+                                for queue in connector.device_threads[device_name]["video"].queues:
+                                    queue.put(data["event"])
+                            elif data["event"]["name"] == "livestream audio data":
+                                for queue in connector.device_threads[device_name]["audio"].queues:
+                                    queue.put(data["event"])
+                    elif data["type"] == "result" and data["success"] == True:
+                        if data["result"]["messageId"] == "start_livestream":
+                            device_name = next((device["name"] for device in devices if device["serialNumber"] == data["result"]["serialNumber"]), None)
+                            if device_name:
+                                connector.device_threads[device_name] = {
+                                    "video": ClientAcceptThread(connector.sockets[device_name]["video"], run_event, "Video", ws, data["result"]["serialNumber"]),
+                                    "audio": ClientAcceptThread(connector.sockets[device_name]["audio"], run_event, "Audio", ws, data["result"]["serialNumber"]),
+                                    "backchannel": ClientAcceptThread(connector.sockets[device_name]["backchannel"], run_event, "BackChannel", ws, data["result"]["serialNumber"])
+                                }
+                                connector.device_threads[device_name]["video"].start()
+                                connector.device_threads[device_name]["audio"].start()
+                                connector.device_threads[device_name]["backchannel"].start()
+                        elif data["result"]["messageId"] == "stop_livestream":
+                            device_name = next((device["name"] for device in devices if device["serialNumber"] == data["result"]["serialNumber"]), None)
+                            if device_name:
+                                for thread in connector.device_threads[device_name].values():
+                                    thread.run_event.set()
+                                del connector.device_threads[device_name]
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+
+    connector.stop()
+
+if __name__ == "__main__":
+    ws_url = os.getenv('EUFY_SECURITY_WS_URL', 'ws://localhost')
+    ws_port = os.getenv('EUFY_SECURITY_WS_PORT', '3000')
+
+    asyncio.run(run(ws_url, ws_port))
