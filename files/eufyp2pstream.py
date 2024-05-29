@@ -13,7 +13,11 @@ from queue import Queue
 
 RECV_CHUNK_SIZE = 4096
 
-EVENT_CONFIGURATION = {
+video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+audio_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+backchannel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+EVENT_CONFIGURATION: dict = {
     "livestream video data": {
         "name": "video_data",
         "value": "buffer",
@@ -223,153 +227,103 @@ class ClientRecvThread(threading.Thread):
         msg["serialNumber"] = self.serialno
         asyncio.run(self.ws.send_message(json.dumps(msg)))
 
-class DeviceHandler:
-    def __init__(self, serialno, ws):
-        self.serialno = serialno
-        self.ws = ws
-        self.video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.audio_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.backchannel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        self.setup_sockets()
-
-        self.video_thread = ClientAcceptThread(self.video_sock, run_event, "Video", ws, serialno)
-        self.audio_thread = ClientAcceptThread(self.audio_sock, run_event, "Audio", ws, serialno)
-        self.backchannel_thread = ClientAcceptThread(self.backchannel_sock, run_event, "BackChannel", ws, serialno)
-
-        self.start_threads()
-
-    def setup_sockets(self):
-        self.video_sock.bind(("0.0.0.0", 0))
-        self.video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.video_sock.settimeout(1)
-        self.video_sock.listen()
-
-        self.audio_sock.bind(("0.0.0.0", 0))
-        self.audio_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.audio_sock.settimeout(1)
-        self.audio_sock.listen()
-
-        self.backchannel_sock.bind(("0.0.0.0", 0))
-        self.backchannel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.backchannel_sock.settimeout(1)
-        self.backchannel_sock.listen()
-
-    def start_threads(self):
-        self.video_thread.start()
-        self.audio_thread.start()
-        self.backchannel_thread.start()
-
-    def stop(self):
-        self.stop_socket(self.video_sock)
-        self.stop_socket(self.audio_sock)
-        self.stop_socket(self.backchannel_sock)
-
-    @staticmethod
-    def stop_socket(sock):
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            print("Error shutdown socket")
-        sock.close()
-
 class Connector:
     def __init__(self, run_event):
-        self.devices = {}
+        video_sock.bind(("0.0.0.0", 63336))
+        video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        video_sock.settimeout(1)  # timeout for listening
+        video_sock.listen()
+        audio_sock.bind(("0.0.0.0", 63337))
+        audio_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        audio_sock.settimeout(1)  # timeout for listening
+        audio_sock.listen()
+        backchannel_sock.bind(("0.0.0.0", 63338))
+        backchannel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        backchannel_sock.settimeout(1)  # timeout for listening
+        backchannel_sock.listen()
         self.ws = None
         self.run_event = run_event
+        self.serialno = ""
 
     def stop(self):
-        for device in self.devices.values():
-            device.stop()
-
-    def set_ws(self, ws: EufySecurityWebSocket):
-        self.ws = ws
-
-    async def on_open(self):
-        print(" on_open - executed")
-
-    async def on_close(self):
-        print(" on_close - executed")
+        try:
+            video_sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            print("Error shutdown socket")
+        video_sock.close()
+        try:
+            audio_sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            print("Error shutdown socket")
+        audio_sock.close()
+        try:
+            backchannel_sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            print("Error shutdown socket")
+        backchannel_sock.close()
         self.run_event.set()
+
+    def on_open(self, ws):
+        print("on_open - executed")
+        self.ws = ws
+        self.ws.send_message(json.dumps(SET_API_SCHEMA))
+        self.ws.send_message(json.dumps(START_LISTENING_MESSAGE))
+        self.ws.send_message(json.dumps(DRIVER_CONNECT_MESSAGE))
+
+    def on_message(self, ws, message):
+        data = json.loads(message)
+        print("on_message result:", data)
+        sys.stdout.flush()
+
+        if "result" in data:
+            if "stations" in data["result"]["state"]:
+                for station in data["result"]["state"]["stations"]:
+                    if station["serialNumber"] == "T8030P23233318F5":  # replace with your station serial number
+                        print(f"Station found: {station['name']}")
+
+            if "devices" in data["result"]["state"]:
+                for device in data["result"]["state"]["devices"]:
+                    if device["serialNumber"] == "T8600P1023380ED5":  # replace with your device serial number
+                        self.serialno = device["serialNumber"]
+                        print(f"Device found: {device['name']}")
+
+            if data["result"].get("async"):
+                print(f"Async operation started with messageId {data['messageId']}")
+
+        if data.get("event") in EVENT_CONFIGURATION:
+            event_name = EVENT_CONFIGURATION[data["event"]]["name"]
+            if event_name == "video_data":
+                # Send video data to all clients
+                for queue in self.video_accept_thread.queues:
+                    if not queue.full():
+                        queue.put(data)
+            elif event_name == "audio_data":
+                # Send audio data to all clients
+                for queue in self.audio_accept_thread.queues:
+                    if not queue.full():
+                        queue.put(data)
+
+    def on_close(self, ws):
+        print("### closed ###")
         self.ws = None
-        self.stop()
-        os._exit(-1)
 
-    async def on_error(self, message):
-        print(f" on_error - executed - {message}")
+    def connect(self):
+        websocket_url = f"wss://your_websocket_url"  # replace with your actual websocket URL
+        ws = EufySecurityWebSocket(
+            url=websocket_url,
+            on_message=self.on_message,
+            on_close=self.on_close,
+            on_open=self.on_open,
+        )
+        self.video_accept_thread = ClientAcceptThread(video_sock, self.run_event, "Video", self.ws, self.serialno)
+        self.video_accept_thread.start()
+        self.audio_accept_thread = ClientAcceptThread(audio_sock, self.run_event, "Audio", self.ws, self.serialno)
+        self.audio_accept_thread.start()
+        self.backchannel_accept_thread = ClientAcceptThread(backchannel_sock, self.run_event, "BackChannel", self.ws, self.serialno)
+        self.backchannel_accept_thread.start()
+        ws.run_forever()
 
-    async def on_message(self, message):
-        payload = message.json()
-        message_type = payload["type"]
-        if message_type == "result":
-            message_id = payload["messageId"]
-            print(f"on_message result: {payload}")
-            sys.stdout.flush()
-            if message_id == START_LISTENING_MESSAGE["messageId"]:
-                message_result = payload[message_type]
-                states = message_result["state"]
-                for state in states["devices"]:
-                    serialno = state["serialNumber"]
-                    self.devices[serialno] = DeviceHandler(serialno, self.ws)
-            if message_id == TALKBACK_RESULT_MESSAGE["messageId"] and "errorCode" in payload:
-                error_code = payload["errorCode"]
-                if error_code == "device_talkback_not_running":
-                    for device in self.devices.values():
-                        msg = START_TALKBACK.copy()
-                        msg["serialNumber"] = device.serialno
-                        asyncio.run(self.ws.send_message(json.dumps(msg)))
-
-        if message_type == "event":
-            message = payload[message_type]
-            event_type = message["event"]
-            serialno = message["serialNumber"]
-            sys.stdout.flush()
-            if event_type in ["livestream audio data", "livestream video data"]:
-                event_value = message[EVENT_CONFIGURATION[event_type]["value"]]
-                event_data_type = EVENT_CONFIGURATION[event_type]["type"]
-                if event_data_type == "event":
-                    thread_name = "Audio" if event_type == "livestream audio data" else "Video"
-                    device = self.devices[serialno]
-                    thread = device.audio_thread if thread_name == "Audio" else device.video_thread
-                    for queue in thread.queues:
-                        if queue.full():
-                            print(f"{thread_name} queue full.")
-                            queue.get(False)
-                        queue.put(event_value)
-            if event_type == "livestream error":
-                print("Livestream Error!")
-                if self.ws and serialno in self.devices:
-                    device = self.devices[serialno]
-                    msg = START_P2P_LIVESTREAM_MESSAGE.copy()
-                    msg["serialNumber"] = device.serialno
-                    asyncio.run(self.ws.send_message(json.dumps(msg)))
-
-# Websocket connector
-c = Connector(run_event)
-
-async def init_websocket():
-    ws: EufySecurityWebSocket = EufySecurityWebSocket(
-        "402f1039-eufy-security-ws",
-        sys.argv[1],
-        aiohttp.ClientSession(),
-        c.on_open,
-        c.on_message,
-        c.on_close,
-        c.on_error,
-    )
-    c.set_ws(ws)
-    try:
-        await ws.connect()
-        await ws.send_message(json.dumps(START_LISTENING_MESSAGE))
-        await ws.send_message(json.dumps(SET_API_SCHEMA))
-        await ws.send_message(json.dumps(DRIVER_CONNECT_MESSAGE))
-        while not run_event.is_set():
-            await asyncio.sleep(1000)
-    except Exception as ex:
-        print(ex)
-        print("init_websocket failed. Exiting.")
-    os._exit(-1)
-
-loop = asyncio.get_event_loop()
-loop.run_until_complete(init_websocket())
+if __name__ == "__main__":
+    run_event = threading.Event()
+    connector = Connector(run_event)
+    connector.connect()
